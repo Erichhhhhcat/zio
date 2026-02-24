@@ -16,7 +16,7 @@
 
 package zio
 
-import zio.internal.{FiberRenderer, FiberScope}
+import zio.internal.{FiberRenderer, FiberScope, FiberSet}
 import zio.stacktracer.TracingImplicits.disableAutoTrace
 
 import java.io.IOException
@@ -1036,7 +1036,11 @@ object Fiber extends FiberPlatformSpecific {
    * returned chunk is only weakly consistent.
    */
   def roots(implicit trace: Trace): UIO[Chunk[Fiber.Runtime[_, _]]] =
-    ZIO.succeed(Chunk.fromIterator(_roots.iterator))
+    ZIO.succeed {
+      val buf = scala.collection.mutable.ArrayBuffer[Fiber.Runtime[_, _]]()
+      _roots.foreach(f => buf += f)
+      Chunk.fromArray(buf.toArray)
+    }
 
   /**
    * Returns a fiber that has already succeeded with the specified value.
@@ -1070,7 +1074,5 @@ object Fiber extends FiberPlatformSpecific {
   private[zio] val _currentFiber: ThreadLocal[Fiber.Runtime[_, _]] =
     new ThreadLocal[Fiber.Runtime[_, _]]()
 
-  private[zio] val _roots: WeakConcurrentBag[Fiber.Runtime[_, _]] =
-    WeakConcurrentBag[Fiber.Runtime[_, _]](10000, _.isAlive())
-      .withAutoGc(5.seconds)
+  private[zio] val _roots: FiberSet = FiberSet.make()
 }
