@@ -174,7 +174,29 @@ final class Promise[E, A] private (blockingOn: FiberId) extends Serializable {
   private[zio] def succeedUnit(implicit ev0: A =:= Unit, trace: Trace): UIO[Boolean] =
     ZIO.succeed(unsafe.succeedUnit(ev0, trace, Unsafe))
 
+  /**
+   * Links the promise to the completion of the specified fiber. When the fiber
+   * completes, the promise will be completed with the fiber's result, eliminating
+   * the need for an intermediate fiber and reducing allocations.
+   *
+   * This is more efficient than the pattern:
+   * {{{
+   *   fiber.await.flatMap(exit => promise.done(exit)).fork *> promise.await
+   * }}}
+   *
+   * Instead, use:
+   * {{{
+   *   promise.become(fiber) *> promise.await
+   * }}}
+   *
+   * @param fiber The fiber to link to this promise
+   * @return Whether the link was established (false if promise was already completed)
+   */
+  def become(fiber: Fiber.Runtime[E, A])(implicit trace: Trace): UIO[Boolean] =
+    ZIO.succeed(unsafe.become(fiber)(Unsafe))
+
   private[zio] trait UnsafeAPI extends Serializable {
+    def become(fiber: Fiber.Runtime[E, A])(implicit unsafe: Unsafe): Boolean
     def completeWith(io: IO[E, A])(implicit unsafe: Unsafe): Boolean
     def die(e: Throwable)(implicit trace: Trace, unsafe: Unsafe): Boolean
     def done(io: IO[E, A])(implicit unsafe: Unsafe): Unit
@@ -192,6 +214,31 @@ final class Promise[E, A] private (blockingOn: FiberId) extends Serializable {
   private[zio] def state: AtomicReference[Promise.internal.State[E, A]] =
     unsafe.asInstanceOf[AtomicReference[Promise.internal.State[E, A]]]
   private[zio] val unsafe: UnsafeAPI = new AtomicReference(Promise.internal.State.empty[E, A]) with UnsafeAPI { state =>
+    def become(fiber: Fiber.Runtime[E, A])(implicit unsafe: Unsafe): Boolean =
+      state.get() match {
+        case done: Done[?, _] => false
+        case pending =>
+          @annotation.tailrec
+          def loop(): Boolean =
+            state.get() match {
+              case done: Done[?, _] => false
+              case currentPending =>
+                fiber.unsafe.poll match {
+                  case Some(exit) =>
+                    completeWith(ZIO.done(exit))
+                    true
+                  case None =>
+                    if (state.compareAndSet(currentPending, currentPending)) {
+                      fiber.unsafe.addObserver { exit =>
+                        completeWith(ZIO.done(exit))
+                      }(unsafe)
+                      true
+                    } else loop()
+                }
+            }
+          loop()
+      }
+
     def completeWith(io: IO[E, A])(implicit unsafe: Unsafe): Boolean = {
       @annotation.tailrec
       def loop(): Boolean =
