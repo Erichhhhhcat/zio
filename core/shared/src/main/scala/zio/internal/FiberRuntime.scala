@@ -26,6 +26,7 @@ import java.util.concurrent.ConcurrentLinkedQueue
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.{Set => JavaSet}
 import scala.annotation.tailrec
+import zio.internal.FiberSet
 
 final class FiberRuntime[E, A](fiberId: FiberId.Runtime, fiberRefs0: FiberRefs, runtimeFlags0: RuntimeFlags)
     extends Fiber.Runtime.Internal[E, A]
@@ -43,7 +44,7 @@ final class FiberRuntime[E, A](fiberId: FiberId.Runtime, fiberRefs0: FiberRefs, 
   private var _asyncContWith  = null.asInstanceOf[AsyncContWith]
   private val running         = new AtomicBoolean(false)
   private val inbox           = new ConcurrentLinkedQueue[FiberMessage]()
-  private var _children       = null.asInstanceOf[JavaSet[Fiber.Runtime[_, _]]]
+  private var _children       = null.asInstanceOf[FiberSet]
   private var observers       = Nil: List[Exit[E, A] => Unit]
   private var runningExecutor = null.asInstanceOf[Executor]
   private var _stack          = null.asInstanceOf[Array[Continuation]]
@@ -84,16 +85,14 @@ final class FiberRuntime[E, A](fiberId: FiberId.Runtime, fiberRefs0: FiberRefs, 
       )
   }
 
-  private[this] def childrenChunk(children: java.util.Set[Fiber.Runtime[?, ?]]): Chunk[Fiber.Runtime[_, _]] =
-    // may be executed by a foreign fiber (under Sync), hence we're risking a race over the _children variable being set back to null by a concurrent transferChildren call
+  private[this] def childrenChunk(children: FiberSet): Chunk[Fiber.Runtime[_, _]] =
     if (children eq null) Chunk.empty
     else {
-      val bldr = Chunk.newBuilder[Fiber.Runtime[_, _]]
-      children.forEach { child =>
-        if ((child ne null) && child.isAlive())
-          bldr.addOne(child)
+      val buf = scala.collection.mutable.ArrayBuffer[Fiber.Runtime[_, _]]()
+      children.foreach { child =>
+        if (child ne null) buf += child
       }
-      bldr.result()
+      Chunk.fromArray(buf.toArray)
     }
 
   def children(implicit trace: Trace): UIO[Chunk[Fiber.Runtime[_, _]]] =
@@ -568,11 +567,11 @@ final class FiberRuntime[E, A](fiberId: FiberId.Runtime, fiberRefs0: FiberRefs, 
    *
    * '''NOTE''': This method must be invoked by the fiber itself.
    */
-  private def getChildren(): JavaSet[Fiber.Runtime[_, _]] = {
+  private def getChildren(): FiberSet = {
     // executed by the fiber itself, no risk of racing with transferChildren
     var children = _children
     if (children eq null) {
-      children = Platform.newConcurrentWeakSet[Fiber.Runtime[_, _]]()(Unsafe)
+      children = FiberSet.make()
       _children = children
     }
     children
@@ -738,30 +737,28 @@ final class FiberRuntime[E, A](fiberId: FiberId.Runtime, fiberRefs0: FiberRefs, 
    */
   private def interruptAllChildren(): UIO[Any] =
     if (sendInterruptSignalToAllChildren(_children)) {
-      val iterator = _children.iterator()
+      val snapshot = childrenChunk(_children) // make a stable view
       _children = null
 
+      var i    = 0
       var curr: Fiber.Runtime[_, _] = null
 
-      // this finds the next operable child fiber and stores it in the `curr` variable
-      def skip() = {
-        var next: Fiber.Runtime[_, _] = null
-        while (iterator.hasNext && (next eq null)) {
-          next = iterator.next()
-          if ((next ne null) && !next.isAlive())
-            next = null
+      // advance to next alive child in the snapshot
+      def skip(): Unit = {
+        curr = null
+        while (i < snapshot.length && (curr eq null)) {
+          val n = snapshot(i)
+          i += 1
+          if ((n ne null) && n.isAlive()) curr = n
         }
-        curr = next
       }
 
-      // find the first operable child fiber
-      // if there isn't any we can simply return null and save ourselves an effect evaluation
+      // find the first operable child
       skip()
 
-      if (null ne curr) {
-        ZIO
-          .whileLoop(null ne curr)(curr.await(id.location))(_ => skip())(id.location)
-      } else null
+      if (null ne curr)
+        ZIO.whileLoop(null ne curr)(curr.await(id.location))(_ => skip())(id.location)
+      else null
     } else null
 
   private[zio] def isAlive(): Boolean =
@@ -1358,25 +1355,18 @@ final class FiberRuntime[E, A](fiberId: FiberId.Runtime, fiberRefs0: FiberRefs, 
   }
 
   private def sendInterruptSignalToAllChildren(
-    children: JavaSet[Fiber.Runtime[_, _]]
+    children: FiberSet
   ): Boolean =
-    if ((children eq null) || children.isEmpty) false
+    if (children eq null) false
     else {
-      // Initiate asynchronous interruption of all children:
-      val iterator = children.iterator()
-      var told     = false
-      val cause    = Cause.interrupt(fiberId)
-
-      while (iterator.hasNext) {
-        val next = iterator.next()
-
+      var told  = false
+      val cause = Cause.interrupt(fiberId)
+      children.foreach { next =>
         if ((next ne null) && next.isAlive()) {
           next.tellInterrupt(cause)
-
           told = true
         }
       }
-
       told
     }
 
@@ -1543,7 +1533,7 @@ final class FiberRuntime[E, A](fiberId: FiberId.Runtime, fiberRefs0: FiberRefs, 
    */
   private[zio] def transferChildren(scope: FiberScope): Unit = {
     val children = _children
-    if ((children ne null) && !children.isEmpty) {
+    if (children ne null) {
       val childs = childrenChunk(children)
       // we're effectively clearing this set, seems cheaper to 'drop' it and allocate a new one if we spawn more fibers
       // a concurrent children call might get the stale set, but this method (and its primary usage for dumping fibers)
@@ -1551,7 +1541,7 @@ final class FiberRuntime[E, A](fiberId: FiberId.Runtime, fiberRefs0: FiberRefs, 
       _children = null
 
       // Might be empty because all the children have already exited
-      if (!childs.isEmpty) {
+      if (childs.nonEmpty) {
         val flags = _runtimeFlags
         scope.addAll(self, flags, childs)(location, Unsafe)
       }
