@@ -28,6 +28,17 @@ private[zio] abstract class DefaultExecutors {
   final def makeDefault(autoBlocking: Boolean): zio.Executor =
     new ZScheduler(autoBlocking)
 
+  /**
+   * Creates an NIO Scheduler using the Thread-Per-Core model.
+   * This is an alternative executor that may provide better performance
+   * for certain workloads.
+   */
+  final def makeNIO(): zio.Executor =
+    makeNIO(false)
+
+  final def makeNIO(autoBlocking: Boolean): zio.Executor =
+    new NIOScheduler(autoBlocking)
+
   final def fromThreadPoolExecutor(
     es: ThreadPoolExecutor
   ): zio.Executor =
